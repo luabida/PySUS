@@ -36,7 +36,9 @@ class TestManagementCheck:
         assert result.exit_code == 0
         assert "DATABASE" in result.output
         assert "TOTAL" in result.output
-        engine.check.assert_awaited_once_with(datasets=None)
+        engine.check.assert_awaited_once_with(
+            datasets=None, groups=None, force=False
+        )
 
     @patch("pysus.cli.management._load_env")
     def test_check_specific_databases(self, mock_env):
@@ -57,7 +59,9 @@ class TestManagementCheck:
             )
         assert result.exit_code == 0
         engine.check.assert_awaited_once_with(
-            datasets=["SINAN", "SINASC", "SIM"]
+            datasets=["SINAN", "SINASC", "SIM"],
+            groups=None,
+            force=False,
         )
 
     @patch("pysus.cli.management._load_env")
@@ -134,7 +138,9 @@ class TestManagementCheck:
                 ],
             )
         assert result.exit_code == 0
-        engine.check.assert_awaited_once_with(datasets=["SINAN"])
+        engine.check.assert_awaited_once_with(
+            datasets=["SINAN"], groups=None, force=False
+        )
 
     @patch("pysus.cli.management._load_env")
     def test_check_reupload_before_with_apply(self, mock_env):
@@ -266,3 +272,134 @@ class TestManagementCheck:
             / "journal"
             / "reupload-2026-07-06.jsonl"
         )
+
+    @patch("pysus.cli.management._load_env")
+    def test_check_groups_passes_filter(self, mock_env):
+        mock_env.return_value = {"ACCESS_KEY": "ak", "SECRET_KEY": "sk"}
+        engine = _make_engine({})
+        with patch("pysus.management.sync.SyncEngine", return_value=engine):
+            result = runner.invoke(
+                app,
+                [
+                    "management",
+                    "check",
+                    "SIA",
+                    "--group",
+                    "AD,AN",
+                    "--group",
+                    "BI",
+                ],
+            )
+        assert result.exit_code == 0
+        engine.check.assert_awaited_once_with(
+            datasets=["SIA"],
+            groups=["AD", "AN", "BI"],
+            force=False,
+        )
+
+    @patch("pysus.cli.management._load_env")
+    def test_check_reupload_encoding_sets_targets_and_force(self, mock_env):
+        from pysus.management.sync import (
+            ENCODING_REUPLOAD_DATASETS,
+            ENCODING_REUPLOAD_GROUPS,
+        )
+
+        mock_env.return_value = {"ACCESS_KEY": "ak", "SECRET_KEY": "sk"}
+        engine = _make_engine({})
+        with patch("pysus.management.sync.SyncEngine", return_value=engine):
+            result = runner.invoke(
+                app, ["management", "check", "--reupload-encoding"]
+            )
+        assert result.exit_code == 0
+        engine.check.assert_awaited_once_with(
+            datasets=list(ENCODING_REUPLOAD_DATASETS),
+            groups=sorted(ENCODING_REUPLOAD_GROUPS),
+            force=True,
+        )
+
+    @patch("pysus.cli.management._load_env")
+    def test_check_reupload_encoding_apply_passes_groups(self, mock_env):
+        from pysus.management.sync import (
+            ENCODING_REUPLOAD_DATASETS,
+            ENCODING_REUPLOAD_GROUPS,
+        )
+
+        mock_env.return_value = {"ACCESS_KEY": "ak", "SECRET_KEY": "sk"}
+        engine = _make_engine(
+            {
+                "total": 1,
+                "needs_update": 0,
+                "uploaded": 1,
+                "skipped": 0,
+                "failed": 0,
+                "needs_token": 0,
+            }
+        )
+        with patch("pysus.management.sync.SyncEngine", return_value=engine):
+            result = runner.invoke(
+                app, ["management", "check", "--reupload-encoding", "--apply"]
+            )
+        assert result.exit_code == 0
+        _, kwargs = engine.run.call_args
+        assert kwargs["datasets"] == list(ENCODING_REUPLOAD_DATASETS)
+        assert kwargs["groups"] == sorted(ENCODING_REUPLOAD_GROUPS)
+        assert kwargs["force"] is True
+        assert kwargs["dry_run"] is False
+
+    @patch("pysus.cli.management._load_env")
+    def test_reupload_encoding_uses_resumable_journal(self, mock_env, tmp_path):
+        import pysus.cli.management as management
+        from pysus.management.records import (
+            IdentityKey,
+            SyncOutcome,
+            write_journal_line,
+        )
+
+        journal = (
+            tmp_path
+            / "cache"
+            / "management"
+            / "journal"
+            / "reupload-encoding.jsonl"
+        )
+        write_journal_line(
+            journal,
+            SyncOutcome(
+                key=IdentityKey(
+                    dataset="SIA",
+                    group="AD",
+                    year=2014,
+                    month=12,
+                    state="RJ",
+                    stem="adrj1412",
+                ),
+                origin="ftp",
+                status="uploaded",
+            ),
+        )
+        mock_env.return_value = {"ACCESS_KEY": "ak", "SECRET_KEY": "sk"}
+        engine = _make_engine(
+            {
+                "total": 0,
+                "needs_update": 0,
+                "uploaded": 0,
+                "skipped": 0,
+                "failed": 0,
+                "needs_token": 0,
+            }
+        )
+        with patch.object(management, "CACHEPATH", tmp_path / "cache"):
+            with patch("pysus.management.sync.SyncEngine", return_value=engine):
+                result = runner.invoke(
+                    app,
+                    [
+                        "management",
+                        "check",
+                        "--reupload-encoding",
+                        "--apply",
+                    ],
+                )
+        assert result.exit_code == 0
+        _, kwargs = engine.run.call_args
+        assert kwargs["journal"] == journal
+        assert {outcome.stem for outcome in kwargs["resume"]} == {"adrj1412"}

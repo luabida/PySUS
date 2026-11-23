@@ -48,7 +48,9 @@ def _parse_date(value: str | None) -> datetime | None:
 
 
 def _journal_path(
-    resume: str | None, reupload_before: str | None
+    resume: str | None,
+    reupload_before: str | None,
+    default_name: str | None = None,
 ) -> Path | None:
     """Return the resume journal path for this invocation."""
     if resume:
@@ -60,7 +62,20 @@ def _journal_path(
             / "journal"
             / f"reupload-{reupload_before}.jsonl"
         )
+    if default_name:
+        return Path(CACHEPATH) / "management" / "journal" / default_name
     return None
+
+
+def _parse_groups(values: list[str] | None) -> list[str]:
+    """Flatten repeatable/comma-separated group codes into uppercase."""
+    groups: list[str] = []
+    for value in values or []:
+        for part in str(value).split(","):
+            group = part.strip().upper()
+            if group and group not in groups:
+                groups.append(group)
+    return groups
 
 
 @app.command()
@@ -81,6 +96,19 @@ def check(
         metavar="DATE",
         help="Reprocess files cataloged before DATE (YYYY-MM-DD), e.g. "
         "to regenerate artifacts from an older converter",
+    ),
+    group: list[str] = typer.Option(  # noqa: B008
+        None,
+        "--group",
+        "-g",
+        help="Restrict to group code(s), repeatable or comma-separated "
+        "(e.g. --group AD,AN or -g AD -g AN)",
+    ),
+    reupload_encoding: bool = typer.Option(  # noqa: B008
+        False,
+        "--reupload-encoding",
+        help="Reupload the SIA/SIH groups affected by the DBF encoding "
+        "fix (#389): SIA AD/AN/AR/BI and SIH RD/RJ",
     ),
     resume: str = typer.Option(  # noqa: B008
         None,
@@ -124,6 +152,17 @@ def check(
     Pass ``--apply`` to actually download, convert, upload and catalog the
     outstanding files (the full sync pipeline). Pass ``--json`` to stream
     machine-readable results.
+
+    Use ``--group`` to restrict a run to DATASUS group codes (repeatable
+    or comma-separated), e.g.::
+
+        pysus management check SIA --group AD,AN,BI --force --apply
+
+    ``--reupload-encoding`` is a shortcut for the groups affected by the
+    DBF encoding fix (#389): SIA ``AD``/``AN``/``AR``/``BI`` and SIH
+    ``RD``/``RJ``. It implies ``--force``::
+
+        pysus management check --reupload-encoding --apply
     """
     from pysus.api.client import _run_sync
     from pysus.management.sync import SyncEngine
@@ -136,6 +175,17 @@ def check(
     )
 
     datasets = [d.upper() for d in name] if name else None
+    groups = _parse_groups(group)
+    if reupload_encoding:
+        from pysus.management.sync import (
+            ENCODING_REUPLOAD_DATASETS,
+            ENCODING_REUPLOAD_GROUPS,
+        )
+
+        if datasets is None:
+            datasets = list(ENCODING_REUPLOAD_DATASETS)
+        groups = sorted(set(groups).union(ENCODING_REUPLOAD_GROUPS))
+        force = True
 
     def _flush() -> None:
         import sys
@@ -179,7 +229,11 @@ def check(
     async def _run_check() -> None:
         await engine.__aenter__(lock=False)
         try:
-            checks = await engine.check(datasets=datasets)
+            checks = await engine.check(
+                datasets=datasets,
+                groups=groups or None,
+                force=force,
+            )
         finally:
             await engine.__aexit__(None, None, None)
         _flush()
@@ -193,7 +247,11 @@ def check(
         _run_sync(_run_check())
         return
 
-    journal = _journal_path(resume, reupload_before)
+    journal = _journal_path(
+        resume,
+        reupload_before,
+        default_name=("reupload-encoding.jsonl" if reupload_encoding else None),
+    )
     resume_keys = set()
     resume_origins = None
     if journal is not None and journal.exists():
@@ -234,6 +292,7 @@ def check(
         async with engine:
             report = await engine.run(
                 datasets=datasets,
+                groups=groups or None,
                 force=force,
                 reupload_before=_parse_date(reupload_before),
                 dry_run=False,

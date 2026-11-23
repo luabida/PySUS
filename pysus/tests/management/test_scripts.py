@@ -414,3 +414,183 @@ class TestRelayoutBucketScript:
                     ):
                         assert relayout_bucket.main() == 0
         assert "DRY RUN" in capsys.readouterr().out
+
+
+class TestReuploadEncodingScript:
+    def _journal(self, tmp_path):
+        from pysus.management.records import (
+            IdentityKey,
+            SyncOutcome,
+            write_journal_line,
+        )
+
+        path = tmp_path / "reupload-encoding.jsonl"
+        write_journal_line(
+            path,
+            SyncOutcome(
+                key=IdentityKey(
+                    dataset="SIA",
+                    group="AD",
+                    year=2014,
+                    month=12,
+                    state="RJ",
+                    stem="adrj1412",
+                ),
+                origin="ftp",
+                status="uploaded",
+            ),
+        )
+        write_journal_line(
+            path,
+            SyncOutcome(
+                key=IdentityKey(
+                    dataset="SIA",
+                    group="AD",
+                    year=2014,
+                    month=11,
+                    state="RJ",
+                    stem="adrj1411",
+                ),
+                origin="ftp",
+                status="failed",
+            ),
+        )
+        return path
+
+    def test_journal_summary(self, tmp_path, capsys):
+        from pysus.management.scripts.reupload_encoding import journal_summary
+
+        path = self._journal(tmp_path)
+        assert journal_summary(path) == {"uploaded": 1, "failed": 1}
+        assert journal_summary(tmp_path / "missing.jsonl") == {}
+
+    def test_journal_summary_uses_latest_status(self, tmp_path):
+        from pysus.management.records import (
+            IdentityKey,
+            SyncOutcome,
+            write_journal_line,
+        )
+        from pysus.management.scripts.reupload_encoding import journal_summary
+
+        path = tmp_path / "j.jsonl"
+        key = IdentityKey(
+            dataset="SIA",
+            group="AD",
+            year=2014,
+            month=12,
+            state="RJ",
+            stem="adrj1412",
+        )
+        write_journal_line(
+            path, SyncOutcome(key=key, origin="ftp", status="failed")
+        )
+        write_journal_line(
+            path, SyncOutcome(key=key, origin="ftp", status="uploaded")
+        )
+        assert journal_summary(path) == {"uploaded": 1}
+
+    @pytest.mark.asyncio
+    async def test_run_resumes_journal(self, tmp_path):
+        from pysus.management.scripts import reupload_encoding as mod
+        from pysus.management.sync import (
+            ENCODING_REUPLOAD_DATASETS,
+            ENCODING_REUPLOAD_GROUPS,
+        )
+
+        journal = self._journal(tmp_path)
+        with patch.object(
+            mod,
+            "load_env",
+            return_value={"ACCESS_KEY": "ak", "SECRET_KEY": "sk"},
+        ):
+            with patch.object(mod, "SyncEngine") as mock_cls:
+                engine = mock_cls.return_value
+                engine.__aenter__ = AsyncMock(return_value=engine)
+                engine.__aexit__ = AsyncMock(return_value=None)
+                engine._changed_catalog = False
+                engine.run = AsyncMock(
+                    return_value=MagicMock(summary=lambda: {"total": 1})
+                )
+                summary = await mod.run(journal=journal)
+
+        assert summary == {"total": 1}
+        _, kwargs = engine.run.call_args
+        assert kwargs["datasets"] == list(ENCODING_REUPLOAD_DATASETS)
+        assert kwargs["groups"] == ENCODING_REUPLOAD_GROUPS
+        assert kwargs["force"] is True
+        assert kwargs["journal"] == journal
+        assert len(kwargs["resume"]) == 1
+        key = next(iter(kwargs["resume"]))
+        assert key.stem == "adrj1412"
+        assert kwargs["resume_origins"][key] == {"ftp"}
+
+    @pytest.mark.asyncio
+    async def test_run_reset_starts_clean(self, tmp_path):
+        from pysus.management.scripts import reupload_encoding as mod
+
+        journal = self._journal(tmp_path)
+        with patch.object(mod, "load_env", return_value={}):
+            with patch.object(mod, "SyncEngine") as mock_cls:
+                engine = mock_cls.return_value
+                engine.__aenter__ = AsyncMock(return_value=engine)
+                engine.__aexit__ = AsyncMock(return_value=None)
+                engine._changed_catalog = False
+                engine.run = AsyncMock(
+                    return_value=MagicMock(summary=lambda: {"total": 0})
+                )
+                await mod.run(journal=journal, reset=True)
+
+        assert not journal.exists()
+        _, kwargs = engine.run.call_args
+        assert kwargs["resume"] is None
+        assert kwargs["resume_origins"] is None
+
+    @pytest.mark.asyncio
+    async def test_interrupt_checkpoints_catalog(self, tmp_path):
+        from pysus.management.scripts import reupload_encoding as mod
+
+        with patch.object(mod, "load_env", return_value={}):
+            with patch.object(mod, "SyncEngine") as mock_cls:
+                engine = mock_cls.return_value
+                engine.__aenter__ = AsyncMock(return_value=engine)
+                engine.__aexit__ = AsyncMock(return_value=None)
+                engine._changed_catalog = True
+                engine._checkpoint = AsyncMock()
+                engine.run = AsyncMock(side_effect=KeyboardInterrupt)
+
+                with pytest.raises(KeyboardInterrupt):
+                    await mod.run(journal=tmp_path / "j.jsonl")
+
+        engine._checkpoint.assert_awaited_once()
+
+    def test_status_main(self, tmp_path, capsys):
+        from pysus.management.scripts import reupload_encoding as mod
+
+        journal = self._journal(tmp_path)
+        with patch(
+            "sys.argv", ["reupload", "--status", "--journal", str(journal)]
+        ):
+            assert mod.main() == 0
+        out = capsys.readouterr().out
+        assert '"uploaded": 1' in out
+        assert '"failed": 1' in out
+
+    @pytest.mark.asyncio
+    async def test_run_dataset_filter(self, tmp_path):
+        from pysus.management.scripts import reupload_encoding as mod
+
+        with patch.object(mod, "load_env", return_value={}):
+            with patch.object(mod, "SyncEngine") as mock_cls:
+                engine = mock_cls.return_value
+                engine.__aenter__ = AsyncMock(return_value=engine)
+                engine.__aexit__ = AsyncMock(return_value=None)
+                engine._changed_catalog = False
+                engine.run = AsyncMock(
+                    return_value=MagicMock(summary=lambda: {"total": 0})
+                )
+                await mod.run(
+                    journal=tmp_path / "j.jsonl", datasets=["sih", "SIH"]
+                )
+
+        _, kwargs = engine.run.call_args
+        assert kwargs["datasets"] == ["SIH"]

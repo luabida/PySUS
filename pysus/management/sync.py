@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from logging import error, info, warning
 from pathlib import Path
@@ -40,6 +40,7 @@ from .compare import Comparator
 from .inventory import Inventory
 from .records import (
     DOWNLOAD_PRIORITY,
+    FRESH_OUTDATED,
     DatabaseCheck,
     FileComparison,
     FileRecord,
@@ -103,6 +104,89 @@ _CONCURRENCY_BUDGET: int = 2500 * 1024 * 1024  # 2.5 GB
 #: producer, so the flush is soft-capped and retried by the next
 #: checkpoint (or the final teardown flush).
 _FLUSH_TIMEOUT: float = 600.0  # 10 minutes
+
+#: Datasets/groups whose S3 Parquet mirror was produced by the pre-fix
+#: latin-1 DBF reader and must be regenerated after #389/#390.
+#: SIA AD/AN/AR/BI use cp1252 encoded identifiers; SIH RD/RJ use cp850
+#: free-text fields. Other groups are either latin-1 or ASCII-only.
+ENCODING_REUPLOAD_DATASETS: tuple[str, ...] = ("SIA", "SIH")
+ENCODING_REUPLOAD_GROUPS: tuple[str, ...] = (
+    "AD",
+    "AN",
+    "AR",
+    "BI",
+    "RD",
+    "RJ",
+)
+
+
+def _canonical_groups(groups: Iterable[str] | None) -> frozenset[str] | None:
+    """Normalize a group filter to an uppercase set, or ``None``."""
+    if not groups:
+        return None
+    normalized = {
+        str(group).strip().upper() for group in groups if str(group).strip()
+    }
+    return frozenset(normalized) or None
+
+
+def _record_group(record: FileRecord) -> str | None:
+    """Return the group code for *record*, parsing S3 keys when needed.
+
+    Older DuckLake catalog rows may have ``group_id NULL`` even when the
+    S3 object key carries the group segment; fall back to the key layout
+    ``public/data/<origin>/<dataset>/<group>/...``.
+    """
+    if record.group:
+        return record.group
+    if record.origin == "ducklake" and record.path:
+        parts = record.path.replace("\\", "/").split("/")
+        if len(parts) >= 5 and parts[0] == "public" and parts[1] == "data":
+            value = parts[4].strip().upper()
+            if value and value != "_":
+                return value
+    return None
+
+
+def _filter_records_by_groups(
+    records: Iterable[FileRecord], groups: frozenset[str] | None
+) -> list[FileRecord]:
+    """Keep only records whose group is in *groups* (no-op when unset)."""
+    if not groups:
+        return list(records)
+    return [record for record in records if _record_group(record) in groups]
+
+
+def _comparison_groups(comparison: FileComparison) -> frozenset[str]:
+    """Return every group code visible in *comparison* (key + records)."""
+    groups: set[str] = set()
+    if comparison.key.group:
+        groups.add(comparison.key.group.upper())
+    for record in comparison.records:
+        group = _record_group(record)
+        if group:
+            groups.add(group)
+    return frozenset(groups)
+
+
+def _filter_comparisons_by_groups(
+    comparisons: Iterable[FileComparison],
+    groups: frozenset[str] | None,
+) -> list[FileComparison]:
+    """Keep comparisons with any group in *groups* (no-op when unset).
+
+    Filtering comparisons rather than records keeps origin records whose
+    own parser could not infer a group (e.g. legacy SIH ZIP names) paired
+    with their S3 mirror, which does carry the group in its object key.
+    """
+    if not groups:
+        return list(comparisons)
+    return [
+        comparison
+        for comparison in comparisons
+        if _comparison_groups(comparison) & groups
+        and any(record.origin != "ducklake" for record in comparison.records)
+    ]
 
 
 class _WeightGate:
@@ -832,6 +916,7 @@ class SyncEngine:
         resume: set[IdentityKey] | None = None,
         resume_origins: dict[IdentityKey, set[str]] | None = None,
         journal: Path | None = None,
+        groups: Iterable[str] | None = None,
     ) -> SyncReport:
         """Run the full pipeline and return a :class:`SyncReport`.
 
@@ -839,6 +924,10 @@ class SyncEngine:
         ``force`` or the source size proves a change (trust-the-catalog
         policy); FTP is preferred over DadosGov, which requires
         ``dadosgov_token``.
+
+        ``groups`` restricts the run to one or more FTP/DATASUS group
+        codes (e.g. ``AD``, ``BI``, ``RD``); it applies to both origins
+        and S3 mirrors so only matching files are compared or reuploaded.
 
         ``reupload_before`` re-processes every file whose S3 catalog row
         was written before the given datetime, even when the catalog is
@@ -871,6 +960,7 @@ class SyncEngine:
         called once per processed logical file.
         """
         report = SyncReport(dataset=",".join(datasets) if datasets else None)
+        selected_groups = _canonical_groups(groups)
         active_origins = origins or ("ducklake", "ftp", "dadosgov", "saude")
 
         if not dry_run:
@@ -911,7 +1001,10 @@ class SyncEngine:
         if "saude" in active_origins:
             records["saude"] = await collect_with_retry("saude", datasets)
 
-        comparisons = self.comparator.compare(sum(records.values(), []))
+        comparisons = _filter_comparisons_by_groups(
+            self.comparator.compare(sum(records.values(), [])),
+            selected_groups,
+        )
 
         # Pre-connect every adapter involved so concurrent workers never
         # race the initial catalog download.
@@ -1335,6 +1428,8 @@ class SyncEngine:
     async def check(
         self,
         datasets: list[str] | None = None,
+        groups: Iterable[str] | None = None,
+        force: bool = False,
     ) -> dict[str, DatabaseCheck]:
         """Check which mirrored files need updating, per database.
 
@@ -1349,10 +1444,15 @@ class SyncEngine:
         No downloads, uploads or catalog writes are performed. Returns a
         mapping of ``{dataset: DatabaseCheck}``. A database ``needs_update``
         when it has any missing or outdated files.
+
+        ``groups`` restricts the check to specific group codes (applied to
+        both origins and S3 mirrors); ``force`` marks every selected file
+        as outdated so the result previews a forced reupload.
         """
         if isinstance(datasets, str):
             datasets = [datasets.upper()]
 
+        selected_groups = _canonical_groups(groups)
         records: list[FileRecord] = await self.inventory.collect(
             "ducklake", datasets
         )
@@ -1362,14 +1462,22 @@ class SyncEngine:
                 "dadosgov", datasets, dadosgov_token=self.dadosgov_token
             )
 
-        comparisons = self.comparator.compare(records)
+        comparisons = _filter_comparisons_by_groups(
+            self.comparator.compare(records), selected_groups
+        )
 
         checks: dict[str, DatabaseCheck] = {}
         for comparison in comparisons:
             ds = checks.setdefault(
                 comparison.key.dataset, DatabaseCheck(comparison.key.dataset)
             )
-            status, reason = freshness_status(comparison)
+            if force:
+                status, reason = (
+                    FRESH_OUTDATED,
+                    "forced reupload requested",
+                )
+            else:
+                status, reason = freshness_status(comparison)
             ds.add(status, self._label(comparison), reason)
         return checks
 

@@ -19,7 +19,7 @@ def _record(origin, name, dataset="SINAN", year=2025, **kw):
         origin=origin,
         dataset=dataset,
         name=name,
-        path=f"{origin}/{dataset}/{name}",
+        path=kw.pop("path", f"{origin}/{dataset}/{name}"),
         year=year,
         file=kw.pop("file", MagicMock()),
         **kw,
@@ -1060,3 +1060,117 @@ class TestCheck:
         assert len(sinan.outdated) == 1
         assert len(sinan.current) == 1
         assert sinan.needs_update is True
+
+    @pytest.mark.asyncio
+    async def test_check_filters_groups_and_force(self):
+        engine = SyncEngine(access_key="ak", secret_key="sk")
+        engine.dadosgov_token = None
+        ad = _record(
+            "ftp",
+            "ADRJ1412.dbc",
+            dataset="SIA",
+            group="AD",
+            year=2014,
+            month=12,
+            state="RJ",
+        )
+        pa = _record(
+            "ftp",
+            "PAGO0808.dbc",
+            dataset="SIA",
+            group="PA",
+            year=2008,
+            month=8,
+            state="GO",
+        )
+        mock_inv = MagicMock()
+        mock_inv.collect = AsyncMock(
+            side_effect=lambda origin, datasets=None, **kw: (
+                [ad, pa] if origin == "ftp" else []
+            )
+        )
+
+        with patch.object(engine, "_require_pysus", return_value=MagicMock()):
+            with patch(
+                "pysus.management.sync.Inventory", return_value=mock_inv
+            ):
+                checks = await engine.check(
+                    datasets=["SIA"], groups=["AD"], force=True
+                )
+
+        assert list(checks) == ["SIA"]
+        sinan = checks["SIA"]
+        assert len(sinan.outdated) == 1
+        assert "SIA/AD/2014/12/adrj1412" in sinan.outdated[0]
+        assert len(sinan.missing) == 0
+        assert len(sinan.current) == 0
+
+
+class TestGroupFilters:
+    def test_canonical_groups(self):
+        from pysus.management.sync import _canonical_groups
+
+        assert _canonical_groups(None) is None
+        assert _canonical_groups([]) is None
+        assert _canonical_groups([" ad ", "AN", ""]) == {"AD", "AN"}
+
+    def test_record_group_prefers_record_field(self):
+        from pysus.management.sync import _record_group
+
+        rec = _record(
+            "ducklake",
+            "X.parquet",
+            dataset="SIA",
+            group="AD",
+            path="public/data/ftp/sia/PA/2020/01/AC/X.parquet",
+        )
+        assert _record_group(rec) == "AD"
+
+    def test_record_group_parses_ducklake_key(self):
+        from pysus.management.sync import _record_group
+
+        rec = _record(
+            "ducklake",
+            "X.parquet",
+            dataset="SIA",
+            path="public/data/ftp/sia/BI/2020/01/AC/X.parquet",
+        )
+        assert rec.group is None
+        assert _record_group(rec) == "BI"
+
+    def test_filter_records_by_groups(self):
+        from pysus.management.sync import _filter_records_by_groups
+
+        ad = _record("ftp", "A.dbc", dataset="SIA", group="AD")
+        pa = _record("ftp", "P.dbc", dataset="SIA", group="PA")
+        assert _filter_records_by_groups([ad, pa], {"AD"}) == [ad]
+        assert _filter_records_by_groups([ad, pa], None) == [ad, pa]
+
+    def test_filter_comparisons_keeps_group_less_source(self):
+        from pysus.management.sync import _filter_comparisons_by_groups
+
+        ftp = _record(
+            "ftp",
+            "RDAC2017.zip",
+            dataset="SIH",
+            year=2020,
+            month=17,
+            state="AC",
+        )
+        duck = _record(
+            "ducklake",
+            "RDAC2017.parquet",
+            dataset="SIH",
+            year=2020,
+            month=17,
+            state="AC",
+            path="public/data/ftp/sih/RD/2020/17/AC/RDAC2017.parquet",
+        )
+        comparison = FileComparison(key=ftp.identity_key(), records=[ftp, duck])
+        assert _filter_comparisons_by_groups([comparison], {"RD"}) == [
+            comparison
+        ]
+        assert _filter_comparisons_by_groups([comparison], {"PA"}) == []
+
+        s3_only = FileComparison(key=duck.identity_key(), records=[duck])
+        assert _filter_comparisons_by_groups([s3_only], {"RD"}) == []
