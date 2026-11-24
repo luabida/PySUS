@@ -2188,3 +2188,17 @@ async def test_dbf_stream_warns_on_pre_yield_fallback(tmp_dir):
             chunks = await collect_async(DBF(path=path).stream(chunk_size=2))
 
     assert sum(len(chunk) for chunk in chunks) == 2
+
+
+@pytest.mark.asyncio
+async def test_extension_factory_small_dbc_not_detected_as_dbf(tmp_dir):
+    """A tiny DBC shares the DBF header; its extension must win."""
+    from pysus.api.extensions import DBC, ExtensionFactory
+
+    path = tmp_dir / "tiny.dbc"
+    _create_dbf(path, [("VAL", "C", 8, 0)], [("abc",)])
+    data = path.read_bytes()
+    path.write_bytes(data[:-1])
+
+    assert await ExtensionFactory._identify(path) is None
+    assert await ExtensionFactory.get_file_class(path) is DBC

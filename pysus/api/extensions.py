@@ -1253,6 +1253,12 @@ def _detect_tar(path: Path, header: bytes) -> type[Tar] | None:
 
 
 def _detect_dbf(path: Path, header: bytes) -> type[DBF] | None:
+    # DBC files start with an uncompressed DBF header too; for tiny DBCs
+    # the compressed size can look like a plausible DBF record area and
+    # content detection would misclassify them as DBF. Respect the
+    # explicit .dbc extension so the DBC decompressor handles them.
+    if path.suffix.lower() == ".dbc":
+        return None
     if not header or header[0] not in _DBF_SIGNATURES:
         return None
     try:
